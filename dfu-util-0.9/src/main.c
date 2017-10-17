@@ -35,12 +35,10 @@
 
 #include "portable.h"
 #include "dfu.h"
-#include "usb_dfu.h"
 #include "dfu_file.h"
 #include "dfu_load.h"
 #include "dfu_util.h"
 #include "dfuse.h"
-#include "quirks.h"
 
 int verbose = 0;
 
@@ -182,9 +180,6 @@ static void help(void)
 		"  -Z --upload-size <bytes>\tSpecify the expected upload size in bytes\n"
 		"  -D --download <file>\t\tWrite firmware from <file> into device\n"
 		"  -R --reset\t\t\tIssue USB Reset signalling once we're finished\n"
-		"  -r --reset-stm32\t\tFollow STM32 DFU reset procedures to start firmware\n"
-		"  -O --download-reset <file>\tDownload firmware to MCU and reset\n"
-		"  -f --vector-address <address>\tSpecify custom vector address for reset\n"
 		"  -s --dfuse-address <address>\tST DfuSe mode, specify target address for\n"
 		"\t\t\t\traw file download or upload. Not applicable for\n"
 		"\t\t\t\tDfuSe file (.dfu) downloads\n"
@@ -223,16 +218,12 @@ static struct option opts[] = {
 	{ "download", 1, 0, 'D' },
 	{ "reset", 0, 0, 'R' },
 	{ "dfuse-address", 1, 0, 's' },
-	{ "reset-stm32", 0, 0, 'r' },
-	{ "download-reset", 1, 0, 'O' },
-	{ "vector-address", 1, 0, 'f' },
 	{ 0, 0, 0, 0 }
 };
 
 int main(int argc, char **argv)
 {
 	int expected_size = 0;
-	int start_position = 0;
 	unsigned int transfer_size = 0;
 	enum mode mode = MODE_NONE;
 	struct dfu_status status;
@@ -244,7 +235,6 @@ int main(int argc, char **argv)
 	int dfuse_device = 0;
 	int fd;
 	const char *dfuse_options = NULL;
-	int vector_address = 0x08000000;
 	int detach_delay = 5;
 	uint16_t runtime_vendor;
 	uint16_t runtime_product;
@@ -256,7 +246,7 @@ int main(int argc, char **argv)
 
 	while (1) {
 		int c, option_index = 0;
-		c = getopt_long(argc, argv, "hVvleE:d:p:c:i:a:S:t:U:D:Rs:Z:K:r:O:f:", opts,
+		c = getopt_long(argc, argv, "hVvleE:d:p:c:i:a:S:t:U:D:Rs:Z:", opts,
 				&option_index);
 		if (c == -1)
 			break;
@@ -284,7 +274,11 @@ int main(int argc, char **argv)
 			parse_vendprod(optarg);
 			break;
 		case 'p':
+#if (defined(LIBUSB_API_VERSION) && LIBUSB_API_VERSION >= 0x01000102) || (defined(LIBUSBX_API_VERSION) && LIBUSBX_API_VERSION >= 0x01000102)
 			match_path = optarg;
+#else
+			errx(EX_SOFTWARE, "This dfu-util was built without USB path support");
+#endif
 			break;
 		case 'c':
 			/* Configuration */
@@ -315,9 +309,6 @@ int main(int argc, char **argv)
 		case 'Z':
 			expected_size = parse_number("upload-size", optarg);
 			break;
-		case 'K':
-			start_position = parse_number("start-position", optarg);
-			break;
 		case 'D':
 			mode = MODE_DOWNLOAD;
 			file.name = optarg;
@@ -325,18 +316,8 @@ int main(int argc, char **argv)
 		case 'R':
 			final_reset = 1;
 			break;
-		case 'r':
-			mode = MODE_RESET_STM32;
-			break;
-		case 'O':
-			mode = MODE_DOWNLOAD_RESET;
-			file.name = optarg;
-			break;
 		case 's':
 			dfuse_options = optarg;
-			break;
-		case 'f':
-			vector_address = parse_number("vector-address", optarg);
 			break;
 		default:
 			help();
@@ -350,7 +331,7 @@ int main(int argc, char **argv)
 	}
 
 	if (mode == MODE_NONE) {
-		fprintf(stderr, "You need to specify one of -D or -O or -U\n");
+		fprintf(stderr, "You need to specify one of -D or -U\n");
 		help();
 	}
 
@@ -359,7 +340,7 @@ int main(int argc, char **argv)
 		match_config_index = -1;
 	}
 
-	if (mode == MODE_DOWNLOAD || mode == MODE_DOWNLOAD_RESET) {
+	if (mode == MODE_DOWNLOAD) {
 		dfu_load_file(&file, MAYBE_SUFFIX, MAYBE_PREFIX);
 		/* If the user didn't specify product and/or vendor IDs to match,
 		 * use any IDs from the file suffix for device matching */
@@ -375,7 +356,7 @@ int main(int argc, char **argv)
 
 	ret = libusb_init(&ctx);
 	if (ret)
-		errx(EX_IOERR, "unable to initialize libusb: %i", ret);
+		errx(EX_IOERR, "unable to initialize libusb: %s", libusb_error_name(ret));
 
 	if (verbose > 2) {
 		libusb_set_debug(ctx, 255);
@@ -405,7 +386,7 @@ int main(int argc, char **argv)
 	printf("Opening DFU capable USB device...\n");
 	ret = libusb_open(dfu_root->dev, &dfu_root->dev_handle);
 	if (ret || !dfu_root->dev_handle)
-		errx(EX_IOERR, "Cannot open device");
+		errx(EX_IOERR, "Cannot open device: %s", libusb_error_name(ret));
 
 	printf("ID %04x:%04x\n", dfu_root->vendor, dfu_root->product);
 
@@ -424,13 +405,15 @@ int main(int argc, char **argv)
 		runtime_product = dfu_root->product;
 
 		printf("Claiming USB DFU Runtime Interface...\n");
-		if (libusb_claim_interface(dfu_root->dev_handle, dfu_root->interface) < 0) {
-			errx(EX_IOERR, "Cannot claim interface %d",
-				dfu_root->interface);
+		ret = libusb_claim_interface(dfu_root->dev_handle, dfu_root->interface);
+		if (ret < 0) {
+			errx(EX_IOERR, "Cannot claim interface %d: %s",
+				dfu_root->interface, libusb_error_name(ret));
 		}
 
-		if (libusb_set_interface_alt_setting(dfu_root->dev_handle, dfu_root->interface, 0) < 0) {
-			errx(EX_IOERR, "Cannot set alt interface zero");
+		ret = libusb_set_interface_alt_setting(dfu_root->dev_handle, dfu_root->interface, 0);
+		if (ret < 0) {
+			errx(EX_IOERR, "Cannot set alt interface zero: %s", libusb_error_name(ret));
 		}
 
 		printf("Determining device status: ");
@@ -466,7 +449,7 @@ int main(int argc, char **argv)
 				ret = libusb_reset_device(dfu_root->dev_handle);
 				if (ret < 0 && ret != LIBUSB_ERROR_NOT_FOUND)
 					errx(EX_IOERR, "error resetting "
-						"after detach");
+						"after detach: %s", libusb_error_name(ret));
 			}
 			break;
 		case DFU_STATE_dfuERROR:
@@ -532,24 +515,28 @@ int main(int argc, char **argv)
 dfustate:
 #if 0
 	printf("Setting Configuration %u...\n", dfu_root->configuration);
-	if (libusb_set_configuration(dfu_root->dev_handle, dfu_root->configuration) < 0) {
-		errx(EX_IOERR, "Cannot set configuration");
+	ret = libusb_set_configuration(dfu_root->dev_handle, dfu_root->configuration);
+	if (ret < 0) {
+		errx(EX_IOERR, "Cannot set configuration: %s", libusb_error_name(ret));
 	}
 #endif
 	printf("Claiming USB DFU Interface...\n");
-	if (libusb_claim_interface(dfu_root->dev_handle, dfu_root->interface) < 0) {
-		errx(EX_IOERR, "Cannot claim interface");
+	ret = libusb_claim_interface(dfu_root->dev_handle, dfu_root->interface);
+	if (ret < 0) {
+		errx(EX_IOERR, "Cannot claim interface - %s", libusb_error_name(ret));
 	}
 
 	printf("Setting Alternate Setting #%d ...\n", dfu_root->altsetting);
-	if (libusb_set_interface_alt_setting(dfu_root->dev_handle, dfu_root->interface, dfu_root->altsetting) < 0) {
-		errx(EX_IOERR, "Cannot set alternate interface");
+	ret = libusb_set_interface_alt_setting(dfu_root->dev_handle, dfu_root->interface, dfu_root->altsetting);
+	if (ret < 0) {
+		errx(EX_IOERR, "Cannot set alternate interface: %s", libusb_error_name(ret));
 	}
 
 status_again:
 	printf("Determining device status: ");
-	if (dfu_get_status(dfu_root, &status ) < 0) {
-		errx(EX_IOERR, "error get_status");
+	ret = dfu_get_status(dfu_root, &status );
+	if (ret < 0) {
+		errx(EX_IOERR, "error get_status: %s", libusb_error_name(ret));
 	}
 	printf("state = %s, status = %d\n",
 	       dfu_state_to_string(status.bState), status.bStatus);
@@ -644,7 +631,7 @@ status_again:
 			exit(1);
 		} else {
 		    if (dfuload_do_upload(dfu_root, transfer_size,
-			expected_size, start_position, fd) < 0) {
+			expected_size, fd) < 0) {
 			exit(1);
 		    }
 		}
@@ -652,7 +639,6 @@ status_again:
 		break;
 
 	case MODE_DOWNLOAD:
-	case MODE_DOWNLOAD_RESET:
 		if (((file.idVendor  != 0xffff && file.idVendor  != runtime_vendor) ||
 		     (file.idProduct != 0xffff && file.idProduct != runtime_product)) &&
 		    ((file.idVendor  != 0xffff && file.idVendor  != dfu_root->vendor) ||
@@ -670,40 +656,7 @@ status_again:
 		} else {
 			if (dfuload_do_dnload(dfu_root, transfer_size, &file) < 0)
 				exit(1);
-		}
-		if (mode != MODE_DOWNLOAD_RESET) {
-			break;
-		}
-		//fallthrough (no break) is intentional for MODE_DOWNLOAD_RESET
-	case MODE_RESET_STM32:
-		//ST Application Note 3156 Documents how to reset an STM32 out of DFU mode and into firmware mode
-		//Basicly, send the target vector reset address, then a zero-length download command, then by a get status command.
-
-		printf("Resetting STM32, starting firmware at address 0x0%X...\n", vector_address);
-		int set_ret = dfuse_special_command(dfu_root, vector_address, SET_ADDRESS);
-		if( set_ret < 0 ) {
-			printf("Error: Unable to set start address for reseting\n");
-			exit(1);
-		}
-
-		int dret = dfuse_download(dfu_root, 0, NULL, 2);
-
-		if( dret < 0 ) {
-			printf("Error: Unable to initiate zero-length download\n");
-			exit(1);
-		}
-		struct dfu_status dest_status;
-		int rr = dfu_get_status( dfu_root, &dest_status );
-		if( rr < 0 ) {
-			printf("Error: Unable to get status: %d\n", rr);
-			exit(1);
-		}
-
-		if( dest_status.bState != STATE_DFU_MANIFEST) {
-			printf("Error: Expected STM32 to be in dfuMANIFEST state after get-status command!\n");
-		} else {
-			printf("Successfully reset STM32\n");
-		}
+	 	}
 		break;
 	case MODE_DETACH:
 		if (dfu_detach(dfu_root->dev_handle, dfu_root->interface, 1000) < 0) {
@@ -724,7 +677,7 @@ status_again:
 		printf("Resetting USB to switch back to runtime mode\n");
 		ret = libusb_reset_device(dfu_root->dev_handle);
 		if (ret < 0 && ret != LIBUSB_ERROR_NOT_FOUND) {
-			warnx("error resetting after download");
+			errx(EX_IOERR, "error resetting after download: %s", libusb_error_name(ret));
 		}
 	}
 

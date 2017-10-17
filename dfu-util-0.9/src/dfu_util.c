@@ -4,6 +4,7 @@
  * Written by Harald Welte <laforge@openmoko.org>
  * Copyright 2007-2008 by OpenMoko, Inc.
  * Copyright 2013 Hans Petter Selasky <hps@bitfrost.no>
+ * Copyright 2016 Tormod Volden <debian.tormod@gmail.com>
  *
  * Based on existing code of dfu-programmer-0.4
  *
@@ -69,6 +70,56 @@ static int find_descriptor(const uint8_t *desc_list, int list_len,
 		p += (int) desc_list[p];
 	}
 	return -1;
+}
+
+/*
+ * Similar to libusb_get_string_descriptor_ascii but will allow
+ * truncated descriptors (descriptor length mismatch) seen on
+ * e.g. the STM32F427 ROM bootloader.
+ */
+static int get_string_descriptor_ascii(libusb_device_handle *devh,
+    uint8_t desc_index, unsigned char *data, int length)
+{
+	unsigned char tbuf[255];
+	uint16_t langid;
+	int r, di, si;
+
+	/* get the language IDs and pick the first one */
+	r = libusb_get_string_descriptor(devh, 0, 0, tbuf, sizeof(tbuf));
+	if (r < 0) {
+		warnx("Failed to retrieve language identifiers");
+		return r;
+	}
+	if (r < 4 || tbuf[0] < 4 || tbuf[1] != LIBUSB_DT_STRING) {		/* must have at least one ID */
+		warnx("Broken LANGID string descriptor");
+		return -1;
+	}
+	langid = tbuf[2] | (tbuf[3] << 8);
+
+	r = libusb_get_string_descriptor(devh, desc_index, langid, tbuf,
+					 sizeof(tbuf));
+	if (r < 0) {
+		warnx("Failed to retrieve string descriptor %d", desc_index);
+		return r;
+	}
+	if (tbuf[1] != LIBUSB_DT_STRING) {	/* sanity check */
+		warnx("Malformed string descriptor %d, type = 0x%02x", desc_index, tbuf[1]);
+		return -1;
+	}
+	if (tbuf[0] > r) {	/* if short read,           */
+		warnx("Patching string descriptor %d length (was %d, received %d)", desc_index, tbuf[0], r);
+		tbuf[0] = r;	/* fix up descriptor length */
+	}
+
+	/* convert from 16-bit unicode to ascii string */
+	for (di = 0, si = 2; si + 1 < tbuf[0] && di < length; si += 2) {
+		if (tbuf[si + 1])	/* high byte of unicode char */
+			data[di++] = '?';
+		else
+			data[di++] = tbuf[si];
+	}
+	data[di] = 0;
+	return di;
 }
 
 static void probe_configuration(libusb_device *dev, struct libusb_device_descriptor *desc)
@@ -220,14 +271,14 @@ found_dfu:
 					break;
 				}
 				if (intf->iInterface != 0)
-					ret = libusb_get_string_descriptor_ascii(devh,
+					ret = get_string_descriptor_ascii(devh,
 					    intf->iInterface, (void *)alt_name, MAX_DESC_STR_LEN);
 				else
 					ret = -1;
 				if (ret < 1)
 					strcpy(alt_name, "UNKNOWN");
 				if (desc->iSerialNumber != 0)
-					ret = libusb_get_string_descriptor_ascii(devh,
+					ret = get_string_descriptor_ascii(devh,
 					    desc->iSerialNumber, (void *)serial_name, MAX_DESC_STR_LEN);
 				else
 					ret = -1;
@@ -291,6 +342,7 @@ char path_buf[MAX_PATH_LEN];
 
 char *get_path(libusb_device *dev)
 {
+#if (defined(LIBUSB_API_VERSION) && LIBUSB_API_VERSION >= 0x01000102) || (defined(LIBUSBX_API_VERSION) && LIBUSBX_API_VERSION >= 0x01000102)
 	uint8_t path[8];
 	int r,j;
 	r = libusb_get_port_numbers(dev, path, sizeof(path));
@@ -301,6 +353,10 @@ char *get_path(libusb_device *dev)
 		};
 	}
 	return path_buf;
+#else
+# warning "libusb too old - building without USB path support!"
+	return NULL;
+#endif
 }
 
 void probe_devices(libusb_context *ctx)
